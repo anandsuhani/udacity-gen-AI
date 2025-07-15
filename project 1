@@ -1,0 +1,155 @@
+#Loading and Evaluating a Foundation Model
+from transformers import GPT2ForSequenceClassification, GPT2Tokenizer
+import os
+import torch
+
+tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+tokenizer.pad_token = tokenizer.eos_token
+
+model = GPT2ForSequenceClassification.from_pretrained('gpt2')
+model.config.pad_token_id = tokenizer.eos_token_id
+model.gradient_checkpointing_enable()
+
+checkpoint_dir = "/workspace/checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+
+checkpoints = sorted(os.listdir(checkpoint_dir), reverse=True)
+if len(checkpoints) > 3:
+    os.remove(os.path.join(checkpoint_dir, checkpoints[-1]))  
+checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_latest.pth")
+torch.save(model.state_dict(), checkpoint_path)
+
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=64)
+
+from datasets import load_dataset
+import numpy as np
+from transformers import TrainingArguments, Trainer
+dataset=load_dataset("imdb")
+small_test = dataset["test"].select(range(1000)) 
+tokenized_test = small_test.map(tokenize_function, batched=True)
+tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+
+training_args = TrainingArguments(
+    output_dir="./results",
+)
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=1)
+    return {"accuracy": (predictions == labels).mean()}
+
+original_trainer = Trainer(
+    model=model,
+    args=training_args,
+    eval_dataset=tokenized_test,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+)
+
+original_results = original_trainer.evaluate()
+print("Original Model:", original_results)
+
+#Performing Parameter-Efficient Fine-Tuning
+
+from peft import LoraConfig, get_peft_model, TaskType
+from peft import AutoPeftModelForSequenceClassification
+model = GPT2ForSequenceClassification.from_pretrained("gpt2", num_labels=2)
+from transformers import TrainingArguments
+from datasets import load_dataset
+
+training_args = TrainingArguments(
+    output_dir="./results",
+    per_device_train_batch_size=4,
+    learning_rate=2e-5,
+    num_train_epochs=3,
+    logging_dir="./logs",             
+    logging_steps=10,                 
+    evaluation_strategy="epoch",     
+    save_strategy="epoch",    
+    
+)
+
+dataset = load_dataset("imdb")
+small_train = dataset["train"].select(range(5000))
+small_test = dataset["test"].select(range(1000))
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+def tokenize_function(examples):
+    return tokenizer(examples["text"], padding="max_length", truncation=True, max_length=64)
+tokenized_train = small_train.map(tokenize_function, batched=True)
+tokenized_test = small_test.map(tokenize_function, batched=True)
+tokenized_train = tokenized_train.rename_column("label", "labels")
+tokenized_test = tokenized_test.rename_column("label", "labels")
+
+tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+tokenized_test.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+
+peft_config = LoraConfig(
+    r=8, 
+    lora_alpha=16,
+    target_modules=["c_attn"],  
+    lora_dropout=0.1,
+    bias="none",
+    task_type=TaskType.SEQ_CLS,
+)
+
+peft_model = get_peft_model(model, peft_config)
+model.config.pad_token_id = model.config.eos_token_id 
+
+trainer = Trainer(
+    model=peft_model,
+    args=training_args,
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_test,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+#Performing Inference with a PEFT Model
+
+from transformers import GPT2Tokenizer
+from datasets import load_dataset
+
+tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+
+
+dataset = load_dataset("imdb")
+
+from transformers import GPT2ForSequenceClassification
+
+model = GPT2ForSequenceClassification.from_pretrained("gpt2", num_labels=2)
+model.config.pad_token_id = tokenizer.pad_token_id
+
+from transformers import TrainingArguments
+
+training_args = TrainingArguments(
+    output_dir="/tmp/results",
+    per_device_eval_batch_size=4,
+)
+
+from peft import PeftModelForSequenceClassification
+
+peft_model = PeftModelForSequenceClassification.from_pretrained(model,
+    "/tmp/peft-gpt2-imdb"
+)
+
+
+tokenizer.pad_token = tokenizer.eos_token
+peft_model.config.pad_token_id = tokenizer.eos_token_id
+
+peft_trainer = Trainer(
+    model=peft_model,
+    args=training_args,
+    eval_dataset=tokenized_test,
+    tokenizer=tokenizer,
+    compute_metrics=compute_metrics,
+)
+
+fine_tuned_results = peft_trainer.evaluate()
+print("Fine-Tuned Model:", fine_tuned_results)
+
+print("Original Model:", original_results)
+print("Fine-Tuned Model:", fine_tuned_results)
